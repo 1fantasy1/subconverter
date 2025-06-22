@@ -610,31 +610,109 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode, const ProxyGr
                 singleproxy["skip-cert-verify"] = scv.get();
             break;
         case ProxyType::VLESS:
-            singleproxy["type"] = "vless";
-            singleproxy["tls"] = true;
-            if (udp)
-                singleproxy["packet-encoding"] = "xudp";
+            singleproxy["type"] = "vless"; // 协议类型
+            singleproxy["tls"] = true;     // VLESS 通常与 TLS 一起使用
+
             if (!x.UUID.empty())
                 singleproxy["uuid"] = x.UUID;
             if (!x.SNI.empty())
-                singleproxy["servername"] = x.SNI;
+                singleproxy["servername"] = x.SNI; // servername 对应 Clash 的 SNI
+
+            // ALPN (假设 x.Alpn 是 std::vector<std::string> 且已在解析时正确处理)
             if (!x.Alpn.empty())
                 singleproxy["alpn"] = x.Alpn;
-            if (!x.Fingerprint.empty())
-                singleproxy["fingerprint"] = x.Fingerprint;
-            if (x.XTLS == 2) {
-                singleproxy["flow"] = "xtls-rprx-vision";
-            } else if (!x.Flow.empty()) {
-                singleproxy["flow"] = x.Flow;
+
+            // --- 1. 输出 client-fingerprint ---
+            // 使用从 Proxy 对象中解析得到的 Fingerprint
+            if (!x.Fingerprint.empty()) {
+                singleproxy["client-fingerprint"] = x.Fingerprint;
             }
+            // (注意：下面的 REALITY 部分可能会覆盖这个值，我们需要调整)
+
+            // --- 2. 输出 flow ---
+            // 优先使用 x.Flow (来自URI的flow参数)
+            if (!x.Flow.empty()) {
+                singleproxy["flow"] = x.Flow;
+            } else if (x.XTLS != 0) { // 如果 x.Flow 为空，再根据 x.XTLS 判断
+                                      // x.XTLS 是 uint32_t, vision 通常是 2
+                if (x.XTLS == 2) {
+                     singleproxy["flow"] = "xtls-rprx-vision";
+                }
+                // 可以为其他 XTLS 值添加映射，如果项目支持
+            }
+            // 如果 x.Flow 和 x.XTLS 都无效，则不输出 flow 字段
+
+            // --- 3. 处理 REALITY ---
             if (!x.PublicKey.empty() && !x.ShortID.empty()) {
                 singleproxy["reality-opts"]["public-key"] = x.PublicKey;
                 singleproxy["reality-opts"]["short-id"] = x.ShortID;
-                singleproxy["client-fingerprint"] = "random";
+                // 修改：仅当 URI 中没有提供 fingerprint (x.Fingerprint 为空)
+                // 并且我们没有在上面设置过 client-fingerprint 时，REALITY 才设置一个默认的。
+                // 或者，如果 URI 提供了 fingerprint，即使是 REALITY 节点，也优先使用 URI 的。
+                if (x.Fingerprint.empty()) {
+                    // 如果上面没有因为 x.Fingerprint 而设置 client-fingerprint，
+                    // 且这是 REALITY 节点，可以给一个默认值。
+                    // 如果上面已经设置了，这里就不应该再用 "random" 覆盖。
+                    if (!singleproxy["client-fingerprint"].IsDefined()) { // 检查是否已设置
+                       singleproxy["client-fingerprint"] = "chrome"; // 或 "random", "firefox" 等
+                    }
+                }
+                // 如果 x.Fingerprint 不为空，则上面的 `if (!x.Fingerprint.empty())` 已经设置了它，这里不应覆盖。
             }
+
+            // skip-cert-verify (scv 是处理过的 tribool)
             if (!scv.is_undef())
                 singleproxy["skip-cert-verify"] = scv.get();
-            break;
+
+            // --- 4. 输出 network 和相关 opts ---
+            // x.TransferProtocol 应该在解析时从 URI 的 "type" 参数获取
+            if (!x.TransferProtocol.empty()) {
+                if (x.TransferProtocol == "ws") {
+                    singleproxy["network"] = "ws";
+                    // 根据 ext.clash_new_field_name 判断使用新旧字段名
+                    // (ext 是 extra_settings& ext 函数参数)
+                    if (ext.clash_new_field_name) { // 新字段名 (Clash Meta 推荐)
+                        singleproxy["ws-opts"]["path"] = x.Path.empty() ? "/" : x.Path;
+                        if (!x.Host.empty()) { // x.Host 是解析时从 URI "host" 参数获取的 (用于ws-header)
+                            singleproxy["ws-opts"]["headers"]["Host"] = x.Host;
+                        } else if (!x.SNI.empty()) { // 如果 ws-host 未指定，可以使用 SNI 作为 Host header
+                            singleproxy["ws-opts"]["headers"]["Host"] = x.SNI;
+                        }
+                        // 可以添加对 max-early-data 和 early-data-header-name 的支持 (如果需要)
+                        // singleproxy["ws-opts"]["max-early-data"] = 0;
+                        // singleproxy["ws-opts"]["early-data-header-name"] = "Sec-WebSocket-Protocol";
+                    } else { // 旧字段名 (兼容旧版 Clash)
+                        singleproxy["ws-path"] = x.Path.empty() ? "/" : x.Path;
+                        if (!x.Host.empty()) {
+                            singleproxy["ws-headers"]["Host"] = x.Host;
+                        } else if (!x.SNI.empty()) {
+                            singleproxy["ws-headers"]["Host"] = x.SNI;
+                        }
+                    }
+                } else if (x.TransferProtocol == "grpc") {
+                    singleproxy["network"] = "grpc";
+                    // x.Path 在解析时应从 URI "serviceName" 或 "path" 参数获取
+                    singleproxy["grpc-opts"]["grpc-service-name"] = x.Path;
+                }
+                // 如果 x.TransferProtocol == "tcp"，Clash Meta 默认就是 tcp，可以不显式输出 network 字段。
+                // 如果希望总是显式输出 "network: tcp"，可以取消下面的注释：
+                // else if (x.TransferProtocol == "tcp") {
+                //     singleproxy["network"] = "tcp";
+                // }
+            }
+            // 如果 x.TransferProtocol 为空或"tcp"，则默认不输出 network 字段，Clash Meta 会将其视为 TCP。
+
+            // --- 5. 处理 UDP ---
+            // 原始代码: if (udp) singleproxy["packet-encoding"] = "xudp";
+            // Clash Meta VLESS 的 UDP 通常是 udp: true
+            // `udp` 是一个 tribool，它结合了全局设置和节点自身设置
+            if (udp.is_true()) { // 使用处理后的 tribool `udp`
+                singleproxy["udp"] = true;
+            }
+            // 注意：旧版 Clash Premium 可能需要 packet-addr: "xudp"，但 Clash Meta 不需要。
+            // 如果你的目标是 Clash Meta，移除 packet-encoding。
+
+            break; // 结束 VLESS case
         default:
             continue;
         }

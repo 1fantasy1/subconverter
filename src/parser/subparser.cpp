@@ -323,35 +323,48 @@ void anytlsConstruct(
         node.MinIdleSession = to_int(min_idle_session);
 }
 
-void vlessConstruct(
+// src/parser/subparser.cpp
+void vlessConstruct( // 参数列表与你提供的原始版本一致
         Proxy &node,
         const std::string &group,
         const std::string &remarks,
         const std::string &server,
         const std::string &port,
         const std::string &uuid,
-        const std::string &sni,
-        const std::string &alpn,
-        const std::string &fingerprint,
-        const std::string &flow,
-        const std::string &xtls,
-        const std::string &public_key,
-        const std::string &short_id,
+        const std::string &sni_from_uri,         // 参数名是 sni (来自URI)
+        const std::string &alpn_from_uri,        // 参数名是 alpn (来自URI, 编码状态)
+        const std::string &fingerprint_from_uri, // 参数名是 fingerprint (来自URI)
+        const std::string &flow_from_uri,        // 参数名是 flow (来自URI)
+        const std::string &xtls_from_uri,        // 参数名是 xtls (来自URI)
+        const std::string &public_key_from_uri,
+        const std::string &short_id_from_uri,
         tribool tfo,
         tribool scv,
         const std::string &underlying_proxy
 ) {
     commonConstruct(node, ProxyType::VLESS, group, remarks, server, port, tribool(), tfo, scv, tribool(), underlying_proxy);
     node.UUID = uuid;
-    node.SNI = sni;
-    if (!alpn.empty()) {
-        node.Alpn = StringArray{alpn};
+    node.SNI = sni_from_uri; // 直接使用从 URI 解析的 SNI
+
+    // --- 修改 ALPN 处理 ---
+    if (!alpn_from_uri.empty()) {
+        std::string decoded_alpn = urlDecode(alpn_from_uri); // URL解码
+        node.Alpn = split(decoded_alpn, ',');              // 按逗号分割
+        for(auto& s : node.Alpn) {                          // 清理空格
+            s = trim(s);
+        }
+    } else {
+        node.Alpn.clear(); // 如果原始alpn为空，则清空node.Alpn
     }
-    node.Fingerprint = fingerprint;
-    node.Flow = flow;
-    node.XTLS = to_int(xtls);
-    node.PublicKey = public_key;
-    node.ShortID = short_id;
+    // --- 结束 ALPN 处理 ---
+
+    node.Fingerprint = fingerprint_from_uri; // 直接使用从 URI 解析的 fingerprint
+    node.Flow = flow_from_uri;               // 直接使用从 URI 解析的 flow
+    node.XTLS = to_int(xtls_from_uri);       // 转换从 URI 解析的 xtls
+    node.PublicKey = public_key_from_uri;
+    node.ShortID = short_id_from_uri;
+
+    // node.TransferProtocol, node.Path, node.Host 的赋值逻辑将主要在 explodeStdVLESS 中完成
 }
 
 void explodeVmess(std::string vmess, Proxy &node)
@@ -1851,86 +1864,133 @@ void explodeAnyTLS(std::string anytls, Proxy &node) {
 }
 
 void explodeStdVLESS(std::string vless, Proxy &node) {
-    std::string add, port, uuid, sni, alpn, fingerprint, remarks, addition, flow, xtls, public_key, short_id;
+    // 变量声明：保持原有变量，不需要新增给 vlessConstruct 的额外参数
+    std::string add, port, uuid, sni_str, alpn_str, fingerprint_str, remarks, addition, flow_str, xtls_str, public_key_str, short_id_str;
     tribool tfo, scv;
     std::string decoded, userinfo, hostinfo;
     string_array user_parts;
 
-    vless = vless.substr(8);
+    vless = vless.substr(8); // 去掉 "vless://"
     string_size pos;
 
+    // 1. 解析 #remarks (和原来一样)
     pos = vless.rfind("#");
     if (pos != vless.npos) {
         remarks = urlDecode(vless.substr(pos + 1));
         vless.erase(pos);
     }
 
+    // 2. 分离 ?addition 参数 (和原来一样)
     pos = vless.rfind("?");
     if (pos != vless.npos) {
         addition = vless.substr(pos + 1);
         vless.erase(pos);
     }
 
+    // 3. 解析 uuid@host:port 或 base64 部分 (保持原有复杂逻辑)
+    //    确保最终 uuid, add, port 被正确填充
     pos = vless.find("@");
     if (pos != vless.npos) {
-        // 直接从URL中提取UUID
         uuid = vless.substr(0, pos);
         hostinfo = vless.substr(pos + 1);
-        if (regGetMatch(hostinfo, R"(^(.*?):(\d+)$)", 3, 0, &add, &port) != 0)
+        if (regGetMatch(hostinfo, R"(^(.*?):(\d+)$)", 3, 0, &add, &port) != 0) {
+            // 如果从 user@host:port 格式解析失败，可能需要进一步处理或返回
+            // 原始代码在这里直接 return，如果你的链接格式不是这个，需要注意
             return;
+        }
     } else {
-        decoded = urlSafeBase64Decode(vless);
-        uuid = getUrlArg(addition, "uuid");
+        // 尝试从 base64 解码的部分或直接从 addition 中获取 uuid
+        decoded = urlSafeBase64Decode(vless); // 假设 vless 主体是 base64 编码的（如果不是 user@host:port 格式）
 
+        // 尝试从 addition 中获取 uuid (如果存在)
+        if (!addition.empty()) {
+             uuid = getUrlArg(addition, "uuid");
+        }
+
+        // 如果 addition 中没有 uuid，尝试从 decoded 的 userinfo 中解析
         if (uuid.empty() && strFind(decoded, "@") && strFind(decoded, ":")) {
             userinfo = decoded.substr(0, decoded.find('@'));
             hostinfo = decoded.substr(decoded.find('@') + 1);
 
-            if (strFind(userinfo, ":")) {
+            if (strFind(userinfo, ":")) { // 兼容 user:uuid@...
                 user_parts = split(userinfo, ":");
                 if (user_parts.size() >= 2) {
                     uuid = user_parts[1];
                 }
-            } else {
+            } else { // 兼容 uuid@...
                 uuid = userinfo;
             }
+            // 从 hostinfo 解析 add 和 port
+            if (regGetMatch(hostinfo, R"(^(.*?):(\d+)$)", 3, 0, &add, &port) != 0) return;
 
-            if (regGetMatch(hostinfo, R"(^(.*?):(\d+)$)", 3, 0, &add, &port) != 0)
-                return;
-        } else if (regGetMatch(vless, R"(^(.*?):(\d+)$)", 3, 0, &add, &port) != 0) {
-            return;
+        } else if (regGetMatch(decoded.empty() ? vless : decoded, R"(^(.*?):(\d+)$)", 3, 0, &add, &port) != 0) {
+            // 如果解码后也不是 user@host:port，尝试将整个 vless (或 decoded) 部分作为 host:port
+            // 这种情况下 uuid 必须来自 addition
+             if (uuid.empty()) return; // 如果到这里 uuid 还是空的，则无法处理
         }
     }
+    // --- 结束复杂的 uuid, add, port 解析 ---
 
+    // 核心参数检查
     if (uuid.empty()) return;
+    if (add.empty() || port.empty() || port == "0") return;
 
+
+    // 4. 解析 addition 中的参数并直接赋值给 node
     if (!addition.empty()) {
-        sni = getUrlArg(addition, "sni");
-        if (sni.empty()) {
-            sni = getUrlArg(addition, "peer");
+        sni_str = getUrlArg(addition, "sni");
+        if (sni_str.empty()) {
+            sni_str = getUrlArg(addition, "peer"); // 兼容 peer
         }
-        alpn = getUrlArg(addition, "alpn");
-        fingerprint = getUrlArg(addition, "hpkp");
-        flow = getUrlArg(addition, "flow");
-        xtls = getUrlArg(addition, "xtls");
-        public_key = getUrlArg(addition, "pbk");
-        short_id = getUrlArg(addition, "sid");
+        alpn_str = getUrlArg(addition, "alpn");         // 获取原始编码的 alpn 字符串
+        fingerprint_str = getUrlArg(addition, "fp");    // <<< 修改: 使用 "fp"
+        flow_str = getUrlArg(addition, "flow");
+        xtls_str = getUrlArg(addition, "xtls");
+        public_key_str = getUrlArg(addition, "pbk");
+        short_id_str = getUrlArg(addition, "sid");
         tfo = tribool(getUrlArg(addition, "tfo"));
         scv = tribool(getUrlArg(addition, "insecure"));
+
+        // --- 直接处理并赋值 node 的网络相关参数 ---
+        node.TransferProtocol = getUrlArg(addition, "type");
+        if (node.TransferProtocol.empty()) {
+            node.TransferProtocol = "tcp"; // 默认 "tcp"
+        }
+
+        if (node.TransferProtocol == "ws") {
+            node.Path = getUrlArg(addition, "path");
+            if (node.Path.empty()) node.Path = "/"; // ws 默认路径
+            node.Host = getUrlArg(addition, "host"); // ws 的 Host header
+        } else if (node.TransferProtocol == "grpc") {
+            node.Path = getUrlArg(addition, "serviceName"); // grpc service name
+            if (node.Path.empty()) node.Path = getUrlArg(addition, "path"); // 兼容用 path 做 serviceName
+        }
+        // --- 结束网络参数处理 ---
 
         if (remarks.empty()) {
             remarks = urlDecode(getUrlArg(addition, "remark"));
             if (remarks.empty())
                 remarks = urlDecode(getUrlArg(addition, "remarks"));
         }
+    } else {
+        // 如果 addition 为空，也要设置默认 TransferProtocol
+        node.TransferProtocol = "tcp";
     }
 
+
+    // 5. 设置 remarks (和原来一样)
     if (remarks.empty())
         remarks = add + ":" + port;
 
-    vlessConstruct(node, VLESS_DEFAULT_GROUP, remarks, add, port, uuid, sni, alpn, fingerprint, flow, xtls, public_key, short_id, tfo, scv, "");
+    // 6. 调用 vlessConstruct (传递解析好的字符串，vlessConstruct内部再做最终处理和赋值)
+    //    确保这里的参数顺序与 vlessConstruct 定义一致
+    vlessConstruct(node, VLESS_DEFAULT_GROUP, remarks, add, port, uuid,
+                   sni_str, alpn_str, fingerprint_str, flow_str, xtls_str,
+                   public_key_str, short_id_str,
+                   tfo, scv, ""); // 最后一个是 underlying_proxy
 }
 
+// explodeVLESS 函数保持不变
 void explodeVLESS(std::string vless, Proxy &node) {
     vless = regReplace(vless, "(vless)://", "vless://");
     // replace /? with ?
