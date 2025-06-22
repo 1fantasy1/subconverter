@@ -706,7 +706,7 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode, const ProxyGr
             // 原始代码: if (udp) singleproxy["packet-encoding"] = "xudp";
             // Clash Meta VLESS 的 UDP 通常是 udp: true
             // `udp` 是一个 tribool，它结合了全局设置和节点自身设置
-            if (udp.is_true()) { // 使用处理后的 tribool `udp`
+            if (udp) { // 使用处理后的 tribool `udp`
                 singleproxy["udp"] = true;
             }
             // 注意：旧版 Clash Premium 可能需要 packet-addr: "xudp"，但 Clash Meta 不需要。
