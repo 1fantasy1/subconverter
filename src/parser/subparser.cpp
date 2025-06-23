@@ -349,8 +349,17 @@ void vlessConstruct( // 参数列表与你提供的原始版本一致
     // --- 修改 ALPN 处理 ---
     if (!alpn_from_uri.empty()) {
         std::string decoded_alpn = urlDecode(alpn_from_uri); // URL解码
-        node.Alpn = split(decoded_alpn, ',');              // 按逗号分割
-        for(auto& s : node.Alpn) {                          // 清理空格
+
+        // --- 开始修改 ---
+        // node.Alpn = split(decoded_alpn, ','); // 旧的、有问题的代码
+        node.Alpn.clear(); // 先清空目标 vector
+        auto views = split(decoded_alpn, ','); // 获取 string_view 的 vector
+        for (const auto& sv : views) {
+            node.Alpn.emplace_back(sv); // 将每个 string_view 转换为 string 并添加到 node.Alpn
+        }
+        // --- 结束修改 ---
+
+        for(auto& s : node.Alpn) {                          // 清理空格 (这个循环现在操作的是已经转换好的 std::string)
             s = trim(s);
         }
     } else {
